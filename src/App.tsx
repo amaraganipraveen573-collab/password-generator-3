@@ -523,11 +523,24 @@ export default function App() {
   // Google Login / Real-Time Sync Activation
   const handleGoogleSignIn = async () => {
     try {
+      setHmsg('Opening Google sign-in...');
       await signInWithPopup(auth, googleProvider);
       setHmsg('Signed in! Real-time synchronization active.');
     } catch (err: unknown) {
       console.error('Sign in error:', err);
-      setHmsg('Sign-in failed. Please try again.');
+      const firebaseErr = err as { code?: string; message?: string };
+      const code = firebaseErr?.code || '';
+      const domain = typeof window !== 'undefined' ? window.location.hostname : 'your-domain';
+
+      if (code === 'auth/unauthorized-domain') {
+        setHmsg(`Error: Domain "${domain}" is not authorized. In Firebase Console > Authentication > Settings > Authorized domains, add "${domain}".`);
+      } else if (code === 'auth/popup-blocked') {
+        setHmsg('Error: Sign-in popup was blocked by your browser. Please allow popups for this site and try again.');
+      } else if (code === 'auth/popup-closed-by-user') {
+        setHmsg('Sign-in cancelled (popup was closed before completing).');
+      } else {
+        setHmsg(`Sign-in error: ${code || firebaseErr?.message || 'Failed to authenticate'}. Please check authorized domains.`);
+      }
     }
   };
 
