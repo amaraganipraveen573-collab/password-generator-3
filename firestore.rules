@@ -1,0 +1,90 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidPasswordEntry(data) {
+      return data.keys().hasAll(['id', 'name', 'password', 'time', 'userId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'name', 'password', 'time', 'userId', 'createdAt', 'updatedAt'])
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.name is string && data.name.size() <= 120
+        && data.password is string && data.password.size() > 0 && data.password.size() <= 512
+        && data.time is string && data.time.size() <= 64
+        && data.userId is string && data.userId == request.auth.uid
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDeviceState(data) {
+      return data.keys().hasAll(['userId', 'length', 'preset', 'upper', 'lower', 'nums', 'syms', 'similar', 'ambig', 'norepeat', 'start', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'length', 'preset', 'upper', 'lower', 'nums', 'syms', 'similar', 'ambig', 'norepeat', 'start', 'updatedAt'])
+        && data.userId is string && data.userId == request.auth.uid
+        && data.length is int && data.length >= 4 && data.length <= 64
+        && data.preset is string && data.preset.size() <= 32
+        && data.upper is bool && data.lower is bool && data.nums is bool && data.syms is bool
+        && data.similar is bool && data.ambig is bool && data.norepeat is bool && data.start is bool
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow read, write: if false;
+
+      match /passwords/{passwordId} {
+        allow get: if isOwner(userId) && isValidId(passwordId);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(passwordId)
+          && incoming().userId == userId
+          && incoming().id == passwordId
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isValidPasswordEntry(incoming());
+        allow update: if isOwner(userId) && isValidId(passwordId)
+          && isValidPasswordEntry(incoming())
+          && incoming().userId == existing().userId
+          && incoming().id == existing().id
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'password', 'time', 'updatedAt']);
+        allow delete: if isOwner(userId) && isValidId(passwordId);
+      }
+
+      match /device_state/{stateId} {
+        allow get: if isOwner(userId) && isValidId(stateId);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(stateId)
+          && incoming().userId == userId
+          && incoming().updatedAt == request.time
+          && isValidDeviceState(incoming());
+        allow update: if isOwner(userId) && isValidId(stateId)
+          && isValidDeviceState(incoming())
+          && incoming().userId == existing().userId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['length', 'preset', 'upper', 'lower', 'nums', 'syms', 'similar', 'ambig', 'norepeat', 'start', 'updatedAt']);
+        allow delete: if isOwner(userId) && isValidId(stateId);
+      }
+    }
+  }
+}

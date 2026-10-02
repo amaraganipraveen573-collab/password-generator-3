@@ -1,0 +1,97 @@
+{
+  "entities": {
+    "PasswordEntry": {
+      "title": "PasswordEntry",
+      "description": "A saved password entry in the user's vault",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "password": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "time": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "userId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "name", "password", "time", "userId", "createdAt", "updatedAt"]
+    },
+    "DeviceState": {
+      "title": "DeviceState",
+      "description": "Synchronized generator configuration ensuring consistent state across devices",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "length": {
+          "type": "integer"
+        },
+        "preset": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "upper": {
+          "type": "boolean"
+        },
+        "lower": {
+          "type": "boolean"
+        },
+        "nums": {
+          "type": "boolean"
+        },
+        "syms": {
+          "type": "boolean"
+        },
+        "similar": {
+          "type": "boolean"
+        },
+        "ambig": {
+          "type": "boolean"
+        },
+        "norepeat": {
+          "type": "boolean"
+        },
+        "start": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["userId", "length", "preset", "upper", "lower", "nums", "syms", "similar", "ambig", "norepeat", "start", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/passwords/{passwordId}": {
+      "schema": "PasswordEntry",
+      "description": "User saved password records synchronized in real-time"
+    },
+    "/users/{userId}/device_state/{stateId}": {
+      "schema": "DeviceState",
+      "description": "Live device synchronization state"
+    }
+  }
+}

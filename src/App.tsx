@@ -1,0 +1,845 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import {
+  collection,
+  doc,
+  setDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  serverTimestamp
+} from 'firebase/firestore';
+import { auth, db, googleProvider, handleFirestoreError, OperationType } from './firebase';
+import { encryptPassword, decryptPassword } from './crypto';
+
+interface RawVaultItem {
+  id: string;
+  name: string;
+  password: string; // encrypted blob: salt:iv:cipher
+  time: string;
+  userId: string;
+  createdAt?: { toMillis?: () => number };
+}
+
+interface DecryptedItem {
+  id: string;
+  name: string;
+  password: string;
+  time: string;
+}
+
+interface GeneratorConfig {
+  len: number;
+  upper: boolean;
+  lower: boolean;
+  nums: boolean;
+  syms: boolean;
+  similar: boolean;
+  ambig: boolean;
+  norepeat: boolean;
+  start: boolean;
+  preset: string;
+}
+
+const SETS = {
+  upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+  lower: 'abcdefghijklmnopqrstuvwxyz',
+  nums: '0123456789',
+  syms: '!@#$%^&*-_=+?.,:;~'
+};
+const SIMILAR = 'O0oIl1|';
+const BRACKETS = '(){}[]<>\'"`/\\';
+
+const PRESETS: Record<string, Partial<GeneratorConfig> | null> = {
+  custom: null,
+  strong: { len: 20, upper: true, lower: true, nums: true, syms: true, similar: false, ambig: false, norepeat: false, start: false },
+  easy: { len: 14, upper: true, lower: true, nums: true, syms: false, similar: true, ambig: true, norepeat: false, start: false },
+  pin: { len: 6, upper: false, lower: false, nums: true, syms: false, similar: false, ambig: false, norepeat: false, start: false },
+  letters: { len: 16, upper: true, lower: true, nums: false, syms: false, similar: false, ambig: false, norepeat: false, start: true }
+};
+
+function randInt(max: number): number {
+  const buf = new Uint32Array(1);
+  const limit = Math.floor(0x100000000 / max) * max;
+  do {
+    crypto.getRandomValues(buf);
+  } while (buf[0] >= limit);
+  return buf[0] % max;
+}
+
+function clean(chars: string, noSimilar: boolean, noAmbig: boolean): string {
+  let res = chars;
+  if (noSimilar) res = [...res].filter(c => !SIMILAR.includes(c)).join('');
+  if (noAmbig) res = [...res].filter(c => !BRACKETS.includes(c)).join('');
+  return res;
+}
+
+function formatCurrentTime(): string {
+  const d = new Date();
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const day = String(d.getDate()).padStart(2, '0');
+  const month = months[d.getMonth()];
+  const year = d.getFullYear();
+  const hours = String(d.getHours()).padStart(2, '0');
+  const mins = String(d.getMinutes()).padStart(2, '0');
+  return `${day} ${month} ${year}, ${hours}:${mins}`;
+}
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  // Generator Options State
+  const [len, setLen] = useState<number>(16);
+  const [preset, setPreset] = useState<string>('custom');
+  const [upper, setUpper] = useState<boolean>(true);
+  const [lower, setLower] = useState<boolean>(true);
+  const [nums, setNums] = useState<boolean>(true);
+  const [syms, setSyms] = useState<boolean>(true);
+  const [similar, setSimilar] = useState<boolean>(false);
+  const [ambig, setAmbig] = useState<boolean>(false);
+  const [norepeat, setNorepeat] = useState<boolean>(false);
+  const [start, setStart] = useState<boolean>(false);
+
+  // Output & Strength State
+  const [password, setPassword] = useState<string>('');
+  const [msg, setMsg] = useState<string>('');
+  const [strengthText, setStrengthText] = useState<string>('Strength: –');
+  const [barWidth, setBarWidth] = useState<string>('0%');
+  const [barColor, setBarColor] = useState<string>('var(--weak)');
+
+  // History State
+  const [masterPassword, setMasterPassword] = useState<string>('');
+  const [hname, setHname] = useState<string>('');
+  const [hmsg, setHmsg] = useState<string>('');
+  const [rawHistory, setRawHistory] = useState<RawVaultItem[]>([]);
+  const [decryptedHistory, setDecryptedHistory] = useState<DecryptedItem[]>([]);
+  const [historyRevealed, setHistoryRevealed] = useState<boolean>(false);
+
+  const isRemoteSyncRef = useRef<boolean>(false);
+  const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Monitor Auth state
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, user => {
+      setCurrentUser(user);
+      setAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Compute Password Strength
+  const rateStrength = useCallback((lenVal: number, poolSize: number) => {
+    if (poolSize <= 0 || lenVal <= 0) {
+      setStrengthText('Strength: –');
+      setBarWidth('0%');
+      return;
+    }
+    const bits = lenVal * Math.log2(poolSize);
+    let label = 'Weak';
+    let color = 'var(--weak)';
+    if (bits < 40) {
+      label = 'Weak';
+      color = 'var(--weak)';
+    } else if (bits < 60) {
+      label = 'Okay';
+      color = 'var(--mid)';
+    } else if (bits < 90) {
+      label = 'Strong';
+      color = 'var(--accent)';
+    } else {
+      label = 'Very strong';
+      color = 'var(--accent)';
+    }
+    const pct = Math.min(100, (bits / 110) * 100);
+    setBarWidth(`${pct}%`);
+    setBarColor(color);
+    setStrengthText(`Strength: ${label} (${Math.round(bits)} bits)`);
+  }, []);
+
+  // Generate Password
+  const generate = useCallback(
+    (
+      currentLen = len,
+      cUpper = upper,
+      cLower = lower,
+      cNums = nums,
+      cSyms = syms,
+      cSimilar = similar,
+      cAmbig = ambig,
+      cNorepeat = norepeat,
+      cStart = start
+    ) => {
+      const activeGroups: string[] = [];
+      if (cUpper) activeGroups.push(clean(SETS.upper, cSimilar, cAmbig));
+      if (cLower) activeGroups.push(clean(SETS.lower, cSimilar, cAmbig));
+      if (cNums) activeGroups.push(clean(SETS.nums, cSimilar, cAmbig));
+      if (cSyms) activeGroups.push(clean(SETS.syms, cSimilar, cAmbig));
+
+      const validGroups = activeGroups.filter(g => g.length > 0);
+
+      if (!validGroups.length) {
+        setMsg('Select at least one character type.');
+        setPassword('');
+        rateStrength(0, 0);
+        return;
+      }
+
+      const pool = validGroups.join('');
+      if (cNorepeat && currentLen > pool.length) {
+        setMsg("Length is too long for 'no repeats'. Lower the length.");
+        return;
+      }
+
+      const chars: string[] = [];
+      // 1) guarantee at least one character from each active group
+      validGroups.forEach(g => {
+        chars.push(g[randInt(g.length)]);
+      });
+
+      // 2) fill remainder
+      while (chars.length < currentLen) {
+        let options = pool;
+        if (cNorepeat) {
+          options = [...pool].filter(c => !chars.includes(c)).join('');
+        }
+        chars.push(options[randInt(options.length)]);
+      }
+
+      const finalChars = chars.slice(0, currentLen);
+
+      // 3) Fisher-Yates shuffle
+      for (let i = finalChars.length - 1; i > 0; i--) {
+        const j = randInt(i + 1);
+        const temp = finalChars[i];
+        finalChars[i] = finalChars[j];
+        finalChars[j] = temp;
+      }
+
+      // 4) Force start with letter if requested
+      if (cStart) {
+        const letters = clean(SETS.upper + SETS.lower, cSimilar, cAmbig);
+        const k = finalChars.findIndex(c => letters.includes(c));
+        if (k > 0) {
+          const temp = finalChars[0];
+          finalChars[0] = finalChars[k];
+          finalChars[k] = temp;
+        }
+      }
+
+      const result = finalChars.join('');
+      setPassword(result);
+      setMsg('');
+      rateStrength(result.length, pool.length);
+    },
+    [len, upper, lower, nums, syms, similar, ambig, norepeat, start, rateStrength]
+  );
+
+  // Initial password generation on mount
+  useEffect(() => {
+    generate();
+  }, [generate]);
+
+  // Real-Time Firebase Listener for Device State Synchronization
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const stateDocPath = `users/${currentUser.uid}/device_state/current`;
+    const unsubscribe = onSnapshot(
+      doc(db, 'users', currentUser.uid, 'device_state', 'current'),
+      docSnap => {
+        if (!docSnap.exists()) return;
+        const data = docSnap.data();
+        isRemoteSyncRef.current = true;
+
+        if (typeof data.length === 'number') setLen(data.length);
+        if (typeof data.preset === 'string') setPreset(data.preset);
+        if (typeof data.upper === 'boolean') setUpper(data.upper);
+        if (typeof data.lower === 'boolean') setLower(data.lower);
+        if (typeof data.nums === 'boolean') setNums(data.nums);
+        if (typeof data.syms === 'boolean') setSyms(data.syms);
+        if (typeof data.similar === 'boolean') setSimilar(data.similar);
+        if (typeof data.ambig === 'boolean') setAmbig(data.ambig);
+        if (typeof data.norepeat === 'boolean') setNorepeat(data.norepeat);
+        if (typeof data.start === 'boolean') setStart(data.start);
+
+        setTimeout(() => {
+          isRemoteSyncRef.current = false;
+        }, 300);
+      },
+      error => {
+        handleFirestoreError(error, OperationType.GET, stateDocPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentUser]);
+
+  // Broadcast device state changes to Firebase in real-time
+  const syncDeviceState = useCallback(
+    (cfg: GeneratorConfig) => {
+      if (!currentUser || isRemoteSyncRef.current) return;
+
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      syncTimeoutRef.current = setTimeout(async () => {
+        const statePath = `users/${currentUser.uid}/device_state/current`;
+        try {
+          await setDoc(
+            doc(db, 'users', currentUser.uid, 'device_state', 'current'),
+            {
+              userId: currentUser.uid,
+              length: cfg.len,
+              preset: cfg.preset,
+              upper: cfg.upper,
+              lower: cfg.lower,
+              nums: cfg.nums,
+              syms: cfg.syms,
+              similar: cfg.similar,
+              ambig: cfg.ambig,
+              norepeat: cfg.norepeat,
+              start: cfg.start,
+              updatedAt: serverTimestamp()
+            },
+            { merge: true }
+          );
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, statePath);
+        }
+      }, 250);
+    },
+    [currentUser]
+  );
+
+  // Real-Time Firebase Listener for Password History Synchronization
+  useEffect(() => {
+    if (!currentUser) {
+      setRawHistory([]);
+      setDecryptedHistory([]);
+      return;
+    }
+
+    const passwordsPath = `users/${currentUser.uid}/passwords`;
+    const colRef = collection(db, 'users', currentUser.uid, 'passwords');
+
+    const unsubscribe = onSnapshot(
+      colRef,
+      snapshot => {
+        const items: RawVaultItem[] = [];
+        snapshot.forEach(docSnap => {
+          const d = docSnap.data();
+          items.push({
+            id: docSnap.id,
+            name: d.name || 'Untitled',
+            password: d.password,
+            time: d.time || '',
+            userId: d.userId,
+            createdAt: d.createdAt
+          });
+        });
+        items.sort((a, b) => {
+          const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+          const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+          return tB - tA;
+        });
+        setRawHistory(items);
+      },
+      error => {
+        handleFirestoreError(error, OperationType.LIST, passwordsPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentUser]);
+
+  // Decrypt items when master password is valid
+  const decryptVault = useCallback(async (masterKey: string, items: RawVaultItem[]) => {
+    if (!masterKey) {
+      setHmsg('Type your master password.');
+      return false;
+    }
+
+    if (items.length === 0) {
+      setDecryptedHistory([]);
+      setHmsg('No saved passwords yet.');
+      return true;
+    }
+
+    try {
+      const decryptedList: DecryptedItem[] = [];
+      for (const item of items) {
+        const plainPw = await decryptPassword(masterKey, item.password);
+        decryptedList.push({
+          id: item.id,
+          name: item.name,
+          password: plainPw,
+          time: item.time
+        });
+      }
+      setDecryptedHistory(decryptedList);
+      setHmsg('');
+      return true;
+    } catch {
+      setHmsg('Wrong master password.');
+      setDecryptedHistory([]);
+      return false;
+    }
+  }, []);
+
+  // Update decrypted list if rawHistory updates and history is revealed
+  useEffect(() => {
+    if (historyRevealed && masterPassword) {
+      decryptVault(masterPassword, rawHistory);
+    }
+  }, [rawHistory, historyRevealed, masterPassword, decryptVault]);
+
+  // Handlers
+  const handlePresetChange = (newPreset: string) => {
+    setPreset(newPreset);
+    const p = PRESETS[newPreset];
+    if (p) {
+      const newLen = p.len ?? len;
+      const nUpper = p.upper ?? upper;
+      const nLower = p.lower ?? lower;
+      const nNums = p.nums ?? nums;
+      const nSyms = p.syms ?? syms;
+      const nSimilar = p.similar ?? similar;
+      const nAmbig = p.ambig ?? ambig;
+      const nNorepeat = p.norepeat ?? norepeat;
+      const nStart = p.start ?? start;
+
+      setLen(newLen);
+      setUpper(nUpper);
+      setLower(nLower);
+      setNums(nNums);
+      setSyms(nSyms);
+      setSimilar(nSimilar);
+      setAmbig(nAmbig);
+      setNorepeat(nNorepeat);
+      setStart(nStart);
+
+      generate(newLen, nUpper, nLower, nNums, nSyms, nSimilar, nAmbig, nNorepeat, nStart);
+
+      syncDeviceState({
+        len: newLen,
+        preset: newPreset,
+        upper: nUpper,
+        lower: nLower,
+        nums: nNums,
+        syms: nSyms,
+        similar: nSimilar,
+        ambig: nAmbig,
+        norepeat: nNorepeat,
+        start: nStart
+      });
+    }
+  };
+
+  const handleLenChange = (newLen: number) => {
+    setLen(newLen);
+    generate(newLen, upper, lower, nums, syms, similar, ambig, norepeat, start);
+    syncDeviceState({
+      len: newLen,
+      preset,
+      upper,
+      lower,
+      nums,
+      syms,
+      similar,
+      ambig,
+      norepeat,
+      start
+    });
+  };
+
+  const handleOptionChange = (key: keyof GeneratorConfig, value: boolean) => {
+    setPreset('custom');
+    const updated = {
+      len,
+      preset: 'custom',
+      upper: key === 'upper' ? value : upper,
+      lower: key === 'lower' ? value : lower,
+      nums: key === 'nums' ? value : nums,
+      syms: key === 'syms' ? value : syms,
+      similar: key === 'similar' ? value : similar,
+      ambig: key === 'ambig' ? value : ambig,
+      norepeat: key === 'norepeat' ? value : norepeat,
+      start: key === 'start' ? value : start
+    };
+
+    if (key === 'upper') setUpper(value);
+    if (key === 'lower') setLower(value);
+    if (key === 'nums') setNums(value);
+    if (key === 'syms') setSyms(value);
+    if (key === 'similar') setSimilar(value);
+    if (key === 'ambig') setAmbig(value);
+    if (key === 'norepeat') setNorepeat(value);
+    if (key === 'start') setStart(value);
+
+    generate(
+      updated.len,
+      updated.upper,
+      updated.lower,
+      updated.nums,
+      updated.syms,
+      updated.similar,
+      updated.ambig,
+      updated.norepeat,
+      updated.start
+    );
+
+    syncDeviceState(updated);
+  };
+
+  const copyToClipboard = async () => {
+    if (!password) {
+      setMsg('Generate a password first.');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(password);
+    } catch {
+      const pwInput = document.getElementById('pw') as HTMLInputElement | null;
+      if (pwInput) {
+        pwInput.select();
+        document.execCommand('copy');
+      }
+    }
+    setMsg('Copied to clipboard.');
+  };
+
+  const clearPassword = () => {
+    setPassword('');
+    setBarWidth('0%');
+    setStrengthText('Strength: –');
+    setMsg('');
+  };
+
+  // Google Login / Real-Time Sync Activation
+  const handleGoogleSignIn = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+      setHmsg('Signed in! Real-time synchronization active.');
+    } catch (err: unknown) {
+      console.error('Sign in error:', err);
+      setHmsg('Sign-in failed. Please try again.');
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setDecryptedHistory([]);
+      setHistoryRevealed(false);
+      setHmsg('Signed out.');
+    } catch (err) {
+      console.error('Sign out error:', err);
+    }
+  };
+
+  // Save to Real-Time History
+  const savePassword = async () => {
+    if (!masterPassword) {
+      setHmsg('Type your master password.');
+      return;
+    }
+    if (!password) {
+      setHmsg('Generate a password first.');
+      return;
+    }
+
+    if (!currentUser) {
+      setHmsg('Please sign in with Google to enable real-time multi-device sync.');
+      return;
+    }
+
+    try {
+      setHmsg('Encrypting and syncing...');
+      const encryptedBlob = await encryptPassword(masterPassword, password);
+      const entryId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      const entryPath = `users/${currentUser.uid}/passwords/${entryId}`;
+      const entryName = hname.trim() || 'Untitled';
+      const formattedTime = formatCurrentTime();
+
+      await setDoc(doc(db, 'users', currentUser.uid, 'passwords', entryId), {
+        id: entryId,
+        name: entryName,
+        password: encryptedBlob,
+        time: formattedTime,
+        userId: currentUser.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+
+      setHmsg('Saved to history.');
+      setHistoryRevealed(true);
+    } catch (err) {
+      setHmsg('Failed to save to cloud.');
+      handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}/passwords`);
+    }
+  };
+
+  // Show History
+  const showHistory = async () => {
+    if (!currentUser) {
+      setHmsg('Please sign in with Google to view synchronized history.');
+      return;
+    }
+    if (!masterPassword) {
+      setHmsg('Type your master password.');
+      return;
+    }
+
+    setHistoryRevealed(true);
+    await decryptVault(masterPassword, rawHistory);
+  };
+
+  // Delete an entry
+  const deleteEntry = async (entryId: string) => {
+    if (!currentUser) return;
+    const entryPath = `users/${currentUser.uid}/passwords/${entryId}`;
+    try {
+      await deleteDoc(doc(db, 'users', currentUser.uid, 'passwords', entryId));
+      setHmsg('Entry removed.');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, entryPath);
+    }
+  };
+
+  return (
+    <main className="app">
+      {/* Real-Time Sync Status Bar */}
+      <div className="sync-bar">
+        <div className="sync-status">
+          <div className={`sync-dot ${currentUser ? '' : 'offline'}`} />
+          <span>
+            {authReady
+              ? currentUser
+                ? `Real-time sync: Active (${currentUser.email || 'Google User'})`
+                : 'Real-time sync: Ready'
+              : 'Connecting...'}
+          </span>
+        </div>
+        <div className="sync-actions">
+          {currentUser ? (
+            <button type="button" className="sync-btn" onClick={handleSignOut}>
+              Sign out
+            </button>
+          ) : (
+            <button type="button" className="sync-btn" onClick={handleGoogleSignIn}>
+              Sign in with Google
+            </button>
+          )}
+        </div>
+      </div>
+
+      <h1>Password Generator</h1>
+      <p className="sub">Pick your options, then generate. Everything runs in your browser.</p>
+
+      <div className="out">
+        <input
+          id="pw"
+          readOnly
+          aria-label="Generated password"
+          placeholder="Click Generate"
+          value={password}
+        />
+        <button id="copy" type="button" onClick={copyToClipboard}>
+          Copy
+        </button>
+      </div>
+
+      <div className="meter">
+        <div id="bar" style={{ width: barWidth, background: barColor }} />
+      </div>
+      <div id="strength">{strengthText}</div>
+
+      <div className="row">
+        <span>Preset</span>
+        <select
+          id="preset"
+          value={preset}
+          onChange={e => handlePresetChange(e.target.value)}
+        >
+          <option value="custom">Custom</option>
+          <option value="strong">Strong (20 chars, all types)</option>
+          <option value="easy">Easy to read (no look-alikes)</option>
+          <option value="pin">PIN (numbers only)</option>
+          <option value="letters">Letters only</option>
+        </select>
+      </div>
+
+      <div className="row">
+        <span>Length</span>
+        <strong id="lenLabel">{len}</strong>
+      </div>
+      <input
+        type="range"
+        id="len"
+        min={4}
+        max={64}
+        value={len}
+        onChange={e => handleLenChange(Number(e.target.value))}
+      />
+
+      <div className="grid">
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="upper"
+            checked={upper}
+            onChange={e => handleOptionChange('upper', e.target.checked)}
+          />{' '}
+          Uppercase (A–Z)
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="lower"
+            checked={lower}
+            onChange={e => handleOptionChange('lower', e.target.checked)}
+          />{' '}
+          Lowercase (a–z)
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="nums"
+            checked={nums}
+            onChange={e => handleOptionChange('nums', e.target.checked)}
+          />{' '}
+          Numbers (0–9)
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="syms"
+            checked={syms}
+            onChange={e => handleOptionChange('syms', e.target.checked)}
+          />{' '}
+          Symbols (!@#$)
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="similar"
+            checked={similar}
+            onChange={e => handleOptionChange('similar', e.target.checked)}
+          />{' '}
+          No look-alikes (O 0 l 1 I)
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="ambig"
+            checked={ambig}
+            onChange={e => handleOptionChange('ambig', e.target.checked)}
+          />{' '}
+          No brackets/quotes
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="norepeat"
+            checked={norepeat}
+            onChange={e => handleOptionChange('norepeat', e.target.checked)}
+          />{' '}
+          No repeated characters
+        </label>
+        <label className="opt">
+          <input
+            type="checkbox"
+            id="start"
+            checked={start}
+            onChange={e => handleOptionChange('start', e.target.checked)}
+          />{' '}
+          Start with a letter
+        </label>
+      </div>
+
+      <div className="actions">
+        <button id="gen" type="button" onClick={() => generate()}>
+          Generate password
+        </button>
+        <button id="clear" className="ghost" type="button" onClick={clearPassword}>
+          Clear
+        </button>
+      </div>
+      <div id="msg" role="status">
+        {msg}
+      </div>
+
+      <section className="hist">
+        <h2>Private history</h2>
+        <p className="sub" style={{ marginBottom: '4px' }}>
+          Saved in an encrypted vault synchronized across all your devices in real-time with Firebase.
+        </p>
+        <input
+          type="password"
+          id="master"
+          placeholder="Master password"
+          autoComplete="off"
+          value={masterPassword}
+          onChange={e => setMasterPassword(e.target.value)}
+        />
+        <input
+          type="text"
+          id="hname"
+          placeholder="Name (e.g. Gmail)"
+          value={hname}
+          onChange={e => setHname(e.target.value)}
+        />
+        <div className="actions">
+          <button id="hsave" type="button" onClick={savePassword}>
+            Save password
+          </button>
+          <button id="hshow" className="ghost" type="button" onClick={showHistory}>
+            Show history
+          </button>
+        </div>
+        <div id="hmsg" role="status">
+          {hmsg}
+        </div>
+        <div id="hlist">
+          {historyRevealed &&
+            decryptedHistory.map(item => (
+              <div key={item.id} className="item">
+                <div className="item-content">
+                  <div>
+                    {item.name} · {item.time}
+                  </div>
+                  <b>{item.password}</b>
+                </div>
+                <div className="item-actions">
+                  <button
+                    type="button"
+                    className="item-btn"
+                    onClick={() => {
+                      navigator.clipboard.writeText(item.password);
+                      setHmsg(`Copied ${item.name} password.`);
+                    }}
+                    title="Copy"
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    className="item-btn"
+                    onClick={() => deleteEntry(item.id)}
+                    title="Delete"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      </section>
+    </main>
+  );
+}

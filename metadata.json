@@ -1,0 +1,6 @@
+{
+  "name": "Password Generator",
+  "description": "Secure password generator with real-time encrypted history synchronization powered by Firebase Firestore.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
