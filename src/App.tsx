@@ -23,8 +23,9 @@ interface RawVaultItem {
   name: string;
   password: string; // encrypted blob: salt:iv:cipher
   time: string;
-  userId: string;
-  createdAt?: { toMillis?: () => number };
+  userId?: string;
+  isLocal?: boolean;
+  createdAt?: { toMillis?: () => number } | number;
 }
 
 interface DecryptedItem {
@@ -32,6 +33,33 @@ interface DecryptedItem {
   name: string;
   password: string;
   time: string;
+  isLocal?: boolean;
+}
+
+interface AuthWarningState {
+  domain: string;
+  projectId: string;
+  settingsUrl: string;
+}
+
+const LOCAL_STORAGE_KEY = 'vault_local_passwords';
+
+function getLocalVaultItems(): RawVaultItem[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalVaultItems(items: RawVaultItem[]) {
+  try {
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(items));
+  } catch (e) {
+    console.warn('Failed to save to local storage', e);
+  }
 }
 
 interface GeneratorConfig {
@@ -121,6 +149,8 @@ export default function App() {
   const [rawHistory, setRawHistory] = useState<RawVaultItem[]>([]);
   const [decryptedHistory, setDecryptedHistory] = useState<DecryptedItem[]>([]);
   const [historyRevealed, setHistoryRevealed] = useState<boolean>(false);
+  const [authWarning, setAuthWarning] = useState<AuthWarningState | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState<boolean>(false);
 
   const isRemoteSyncRef = useRef<boolean>(false);
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -316,11 +346,11 @@ export default function App() {
     [currentUser]
   );
 
-  // Real-Time Firebase Listener for Password History Synchronization
+  // Synchronize history (Local Vault + Real-Time Firebase)
   useEffect(() => {
     if (!currentUser) {
-      setRawHistory([]);
-      setDecryptedHistory([]);
+      const local = getLocalVaultItems();
+      setRawHistory(local);
       return;
     }
 
@@ -339,15 +369,26 @@ export default function App() {
             password: d.password,
             time: d.time || '',
             userId: d.userId,
-            createdAt: d.createdAt
+            createdAt: d.createdAt,
+            isLocal: false
           });
         });
-        items.sort((a, b) => {
-          const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
-          const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+
+        // Also check if any unmigrated local items exist
+        const local = getLocalVaultItems();
+        const merged = [...items];
+        for (const loc of local) {
+          if (!merged.some(m => m.id === loc.id)) {
+            merged.push({ ...loc, isLocal: true });
+          }
+        }
+
+        merged.sort((a, b) => {
+          const tA = (typeof a.createdAt === 'object' && a.createdAt?.toMillis) ? a.createdAt.toMillis() : 0;
+          const tB = (typeof b.createdAt === 'object' && b.createdAt?.toMillis) ? b.createdAt.toMillis() : 0;
           return tB - tA;
         });
-        setRawHistory(items);
+        setRawHistory(merged);
       },
       error => {
         handleFirestoreError(error, OperationType.LIST, passwordsPath);
@@ -355,6 +396,43 @@ export default function App() {
     );
 
     return () => unsubscribe();
+  }, [currentUser]);
+
+  // When user signs in, automatically upload any offline local vault items to Firestore
+  useEffect(() => {
+    if (!currentUser) return;
+    const local = getLocalVaultItems();
+    if (local.length === 0) return;
+
+    let active = true;
+    const syncLocalToCloud = async () => {
+      let count = 0;
+      for (const item of local) {
+        try {
+          await setDoc(doc(db, 'users', currentUser.uid, 'passwords', item.id), {
+            id: item.id,
+            name: item.name,
+            password: item.password,
+            time: item.time,
+            userId: currentUser.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+          count++;
+        } catch (e) {
+          console.warn('Deferred syncing item to cloud:', item.id, e);
+        }
+      }
+      if (count > 0 && active) {
+        localStorage.removeItem(LOCAL_STORAGE_KEY);
+        setHmsg(`Synced ${count} password${count > 1 ? 's' : ''} to your cloud vault!`);
+      }
+    };
+
+    syncLocalToCloud();
+    return () => {
+      active = false;
+    };
   }, [currentUser]);
 
   // Decrypt items when master password is valid
@@ -378,7 +456,8 @@ export default function App() {
           id: item.id,
           name: item.name,
           password: plainPw,
-          time: item.time
+          time: item.time,
+          isLocal: item.isLocal
         });
       }
       setDecryptedHistory(decryptedList);
@@ -520,26 +599,46 @@ export default function App() {
     setMsg('');
   };
 
+  const handleCopyDomain = async () => {
+    if (!authWarning?.domain) return;
+    try {
+      await navigator.clipboard.writeText(authWarning.domain);
+      setCopiedDomain(true);
+      setTimeout(() => setCopiedDomain(false), 2500);
+    } catch {
+      // fallback
+    }
+  };
+
   // Google Login / Real-Time Sync Activation
   const handleGoogleSignIn = async () => {
     try {
       setHmsg('Opening Google sign-in...');
       await signInWithPopup(auth, googleProvider);
+      setAuthWarning(null);
       setHmsg('Signed in! Real-time synchronization active.');
     } catch (err: unknown) {
-      console.error('Sign in error:', err);
       const firebaseErr = err as { code?: string; message?: string };
       const code = firebaseErr?.code || '';
-      const domain = typeof window !== 'undefined' ? window.location.hostname : 'your-domain';
+      const domain = typeof window !== 'undefined' ? window.location.hostname : '';
 
       if (code === 'auth/unauthorized-domain') {
-        setHmsg(`Error: Domain "${domain}" is not authorized. In Firebase Console > Authentication > Settings > Authorized domains, add "${domain}".`);
+        console.warn(`[Firebase Auth] Domain "${domain}" is not authorized in Firebase Console.`);
+        setAuthWarning({
+          domain: domain || (typeof window !== 'undefined' ? window.location.host : 'Current preview domain'),
+          projectId: 'graphical-castle-m6rpq',
+          settingsUrl: 'https://console.firebase.google.com/project/graphical-castle-m6rpq/authentication/settings'
+        });
+        setHmsg('Domain authorization needed in Firebase Console. Local encrypted vault remains active.');
       } else if (code === 'auth/popup-blocked') {
-        setHmsg('Error: Sign-in popup was blocked by your browser. Please allow popups for this site and try again.');
-      } else if (code === 'auth/popup-closed-by-user') {
-        setHmsg('Sign-in cancelled (popup was closed before completing).');
+        console.warn('[Firebase Auth] Sign-in popup was blocked by browser.');
+        setHmsg('Sign-in popup was blocked. Please allow popups for this site and try again.');
+      } else if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        console.warn('[Firebase Auth] Sign-in cancelled by user.');
+        setHmsg('Sign-in cancelled.');
       } else {
-        setHmsg(`Sign-in error: ${code || firebaseErr?.message || 'Failed to authenticate'}. Please check authorized domains.`);
+        console.warn('[Firebase Auth] Sign-in error:', firebaseErr?.message || code);
+        setHmsg(`Sign-in error: ${firebaseErr?.message || code || 'Authentication failed'}. Local vault active.`);
       }
     }
   };
@@ -547,62 +646,76 @@ export default function App() {
   const handleSignOut = async () => {
     try {
       await signOut(auth);
+      setAuthWarning(null);
+      const local = getLocalVaultItems();
+      setRawHistory(local);
       setDecryptedHistory([]);
       setHistoryRevealed(false);
-      setHmsg('Signed out.');
+      setHmsg('Signed out. Local encrypted vault active.');
     } catch (err) {
-      console.error('Sign out error:', err);
+      console.warn('Sign out error:', err);
     }
   };
 
-  // Save to Real-Time History
+  // Save to History (Cloud when authenticated, Local Encrypted Vault when offline)
   const savePassword = async () => {
     if (!masterPassword) {
       setHmsg('Type your master password.');
       return;
     }
     if (!password) {
-      setHmsg('Generate a password first.');
-      return;
-    }
-
-    if (!currentUser) {
-      setHmsg('Please sign in with Google to enable real-time multi-device sync.');
+      setMsg('Generate a password first.');
       return;
     }
 
     try {
-      setHmsg('Encrypting and syncing...');
+      setHmsg('Encrypting password...');
       const encryptedBlob = await encryptPassword(masterPassword, password);
       const entryId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-      const entryPath = `users/${currentUser.uid}/passwords/${entryId}`;
       const entryName = hname.trim() || 'Untitled';
       const formattedTime = formatCurrentTime();
 
-      await setDoc(doc(db, 'users', currentUser.uid, 'passwords', entryId), {
-        id: entryId,
-        name: entryName,
-        password: encryptedBlob,
-        time: formattedTime,
-        userId: currentUser.uid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
-      });
+      if (currentUser) {
+        setHmsg('Encrypting and syncing to cloud...');
+        const entryPath = `users/${currentUser.uid}/passwords/${entryId}`;
+        await setDoc(doc(db, 'users', currentUser.uid, 'passwords', entryId), {
+          id: entryId,
+          name: entryName,
+          password: encryptedBlob,
+          time: formattedTime,
+          userId: currentUser.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+        setHmsg('Saved to cloud vault.');
+      } else {
+        const newItem: RawVaultItem = {
+          id: entryId,
+          name: entryName,
+          password: encryptedBlob,
+          time: formattedTime,
+          isLocal: true
+        };
+        const local = [newItem, ...getLocalVaultItems().filter(i => i.id !== entryId)];
+        saveLocalVaultItems(local);
+        setRawHistory(local);
+        setHmsg('Saved to local encrypted vault.');
+      }
 
-      setHmsg('Saved to history.');
       setHistoryRevealed(true);
+      setHname('');
     } catch (err) {
-      setHmsg('Failed to save to cloud.');
-      handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}/passwords`);
+      if (currentUser) {
+        setHmsg('Failed to save to cloud.');
+        handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}/passwords`);
+      } else {
+        setHmsg('Failed to save to local vault.');
+      }
     }
   };
 
   // Show History
   const showHistory = async () => {
-    if (!currentUser) {
-      setHmsg('Please sign in with Google to view synchronized history.');
-      return;
-    }
     if (!masterPassword) {
       setHmsg('Type your master password.');
       return;
@@ -613,12 +726,22 @@ export default function App() {
   };
 
   // Delete an entry
-  const deleteEntry = async (entryId: string) => {
-    if (!currentUser) return;
+  const deleteEntry = async (entryId: string, isLocal?: boolean) => {
+    if (isLocal || !currentUser) {
+      const local = getLocalVaultItems().filter(i => i.id !== entryId);
+      saveLocalVaultItems(local);
+      setRawHistory(prev => prev.filter(i => i.id !== entryId));
+      setDecryptedHistory(prev => prev.filter(i => i.id !== entryId));
+      setHmsg('Entry removed from local vault.');
+      return;
+    }
+
     const entryPath = `users/${currentUser.uid}/passwords/${entryId}`;
     try {
       await deleteDoc(doc(db, 'users', currentUser.uid, 'passwords', entryId));
-      setHmsg('Entry removed.');
+      setRawHistory(prev => prev.filter(i => i.id !== entryId));
+      setDecryptedHistory(prev => prev.filter(i => i.id !== entryId));
+      setHmsg('Entry removed from cloud vault.');
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, entryPath);
     }
@@ -629,12 +752,14 @@ export default function App() {
       {/* Real-Time Sync Status Bar */}
       <div className="sync-bar">
         <div className="sync-status">
-          <div className={`sync-dot ${currentUser ? '' : 'offline'}`} />
+          <div className={`sync-dot ${currentUser ? '' : authWarning ? 'warning' : 'offline'}`} />
           <span>
             {authReady
               ? currentUser
-                ? `Real-time sync: Active (${currentUser.email || 'Google User'})`
-                : 'Real-time sync: Ready'
+                ? `Cloud Sync: Active (${currentUser.email || 'Google User'})`
+                : authWarning
+                ? 'Cloud Sync: Domain Setup Required'
+                : 'Vault: Local Encrypted (Cloud Sync ready)'
               : 'Connecting...'}
           </span>
         </div>
@@ -644,12 +769,77 @@ export default function App() {
               Sign out
             </button>
           ) : (
-            <button type="button" className="sync-btn" onClick={handleGoogleSignIn}>
+            <button
+              type="button"
+              className={`sync-btn ${authWarning ? 'highlight' : ''}`}
+              onClick={handleGoogleSignIn}
+            >
               Sign in with Google
             </button>
           )}
         </div>
       </div>
+
+      {authWarning && (
+        <div className="auth-alert" role="alert">
+          <div className="auth-alert-header">
+            <div className="auth-alert-title">
+              <span className="auth-alert-badge">Action Required</span>
+              <span>Firebase Domain Authorization</span>
+            </div>
+            <button
+              type="button"
+              className="auth-alert-close"
+              onClick={() => setAuthWarning(null)}
+              aria-label="Dismiss warning"
+            >
+              ✕
+            </button>
+          </div>
+          <p className="auth-alert-desc">
+            Google Sign-In requires your current preview domain to be in your Firebase authorized domains list:
+          </p>
+          <div className="domain-copy-box">
+            <code className="domain-code">{authWarning.domain}</code>
+            <button
+              type="button"
+              className="domain-copy-btn"
+              onClick={handleCopyDomain}
+            >
+              {copiedDomain ? 'Copied!' : 'Copy Domain'}
+            </button>
+          </div>
+          <div className="auth-alert-steps">
+            <ol>
+              <li>
+                Open{' '}
+                <a
+                  href={authWarning.settingsUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="auth-link"
+                >
+                  Firebase Auth Settings ↗
+                </a>
+              </li>
+              <li>Under <strong>Authorized domains</strong>, click <strong>Add domain</strong></li>
+              <li>Paste the domain and click <strong>Save</strong></li>
+            </ol>
+          </div>
+          <div className="auth-alert-actions">
+            <button
+              type="button"
+              className="sync-btn auth-retry-btn"
+              onClick={handleGoogleSignIn}
+            >
+              Retry Google Sign In
+            </button>
+            <span className="auth-alert-local-note">
+              Local Encrypted Vault is active — you can continue saving passwords right now.
+            </span>
+          </div>
+        </div>
+      )}
 
       <h1>Password Generator</h1>
       <p className="sub">Pick your options, then generate. Everything runs in your browser.</p>
@@ -825,6 +1015,9 @@ export default function App() {
                 <div className="item-content">
                   <div>
                     {item.name} · {item.time}
+                    <span className={`vault-badge ${item.isLocal ? 'local' : 'cloud'}`}>
+                      {item.isLocal ? 'Local' : 'Cloud'}
+                    </span>
                   </div>
                   <b>{item.password}</b>
                 </div>
@@ -843,7 +1036,7 @@ export default function App() {
                   <button
                     type="button"
                     className="item-btn"
-                    onClick={() => deleteEntry(item.id)}
+                    onClick={() => deleteEntry(item.id, item.isLocal)}
                     title="Delete"
                   >
                     Delete
