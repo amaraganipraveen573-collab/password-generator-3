@@ -4,7 +4,14 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
+  User
+} from 'firebase/auth';
 import {
   collection,
   doc,
@@ -151,6 +158,8 @@ export default function App() {
   const [historyRevealed, setHistoryRevealed] = useState<boolean>(false);
   const [authWarning, setAuthWarning] = useState<AuthWarningState | null>(null);
   const [copiedDomain, setCopiedDomain] = useState<boolean>(false);
+  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
+  const [popupClosedWarning, setPopupClosedWarning] = useState<boolean>(false);
 
   const isRemoteSyncRef = useRef<boolean>(false);
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -162,6 +171,32 @@ export default function App() {
       setAuthReady(true);
     });
     return () => unsubscribe();
+  }, []);
+
+  // Check for redirect login response on mount
+  useEffect(() => {
+    getRedirectResult(auth)
+      .then(result => {
+        if (result?.user) {
+          setCurrentUser(result.user);
+          setHmsg('Signed in via redirect! Real-time cloud sync active.');
+        }
+      })
+      .catch(err => {
+        const firebaseErr = err as { code?: string; message?: string };
+        const code = firebaseErr?.code || '';
+        const domain = typeof window !== 'undefined' ? window.location.hostname : '';
+        if (code === 'auth/unauthorized-domain') {
+          setAuthWarning({
+            domain: domain || (typeof window !== 'undefined' ? window.location.host : 'Current domain'),
+            projectId: 'graphical-castle-m6rpq',
+            settingsUrl: 'https://console.firebase.google.com/project/graphical-castle-m6rpq/authentication/settings'
+          });
+          setHmsg('Domain authorization needed in Firebase Console. Local vault remains active.');
+        } else {
+          console.warn('[Firebase Auth] Redirect result info:', err);
+        }
+      });
   }, []);
 
   // Compute Password Strength
@@ -610,12 +645,15 @@ export default function App() {
     }
   };
 
-  // Google Login / Real-Time Sync Activation
+  // Google Login (Popup)
   const handleGoogleSignIn = async () => {
+    if (isSigningIn) return;
     try {
+      setIsSigningIn(true);
       setHmsg('Opening Google sign-in...');
       await signInWithPopup(auth, googleProvider);
       setAuthWarning(null);
+      setPopupClosedWarning(false);
       setHmsg('Signed in! Real-time synchronization active.');
     } catch (err: unknown) {
       const firebaseErr = err as { code?: string; message?: string };
@@ -632,13 +670,43 @@ export default function App() {
         setHmsg('Domain authorization needed in Firebase Console. Local encrypted vault remains active.');
       } else if (code === 'auth/popup-blocked') {
         console.warn('[Firebase Auth] Sign-in popup was blocked by browser.');
-        setHmsg('Sign-in popup was blocked. Please allow popups for this site and try again.');
+        setHmsg('Sign-in popup was blocked. You can use Redirect Sign-In below.');
+        setPopupClosedWarning(true);
       } else if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
-        console.warn('[Firebase Auth] Sign-in cancelled by user.');
-        setHmsg('Sign-in cancelled.');
+        console.warn('[Firebase Auth] Sign-in popup closed automatically or was cancelled.');
+        setHmsg('The sign-in popup closed automatically. You can sign in using full page redirect instead.');
+        setPopupClosedWarning(true);
       } else {
         console.warn('[Firebase Auth] Sign-in error:', firebaseErr?.message || code);
         setHmsg(`Sign-in error: ${firebaseErr?.message || code || 'Authentication failed'}. Local vault active.`);
+      }
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
+
+  // Google Login (Page Redirect — bypasses popups completely)
+  const handleGoogleSignInRedirect = async () => {
+    if (isSigningIn) return;
+    try {
+      setIsSigningIn(true);
+      setHmsg('Redirecting to Google Sign-In...');
+      await signInWithRedirect(auth, googleProvider);
+    } catch (err: unknown) {
+      setIsSigningIn(false);
+      const firebaseErr = err as { code?: string; message?: string };
+      const code = firebaseErr?.code || '';
+      const domain = typeof window !== 'undefined' ? window.location.hostname : '';
+      if (code === 'auth/unauthorized-domain') {
+        setAuthWarning({
+          domain: domain || (typeof window !== 'undefined' ? window.location.host : 'Current domain'),
+          projectId: 'graphical-castle-m6rpq',
+          settingsUrl: 'https://console.firebase.google.com/project/graphical-castle-m6rpq/authentication/settings'
+        });
+        setHmsg('Domain authorization needed in Firebase Console. Local vault remains active.');
+      } else {
+        console.warn('[Firebase Auth] Redirect error:', err);
+        setHmsg(`Redirect error: ${firebaseErr?.message || code}. Local vault active.`);
       }
     }
   };
@@ -647,6 +715,7 @@ export default function App() {
     try {
       await signOut(auth);
       setAuthWarning(null);
+      setPopupClosedWarning(false);
       const local = getLocalVaultItems();
       setRawHistory(local);
       setDecryptedHistory([]);
@@ -769,16 +838,86 @@ export default function App() {
               Sign out
             </button>
           ) : (
-            <button
-              type="button"
-              className={`sync-btn ${authWarning ? 'highlight' : ''}`}
-              onClick={handleGoogleSignIn}
-            >
-              Sign in with Google
-            </button>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                type="button"
+                className={`sync-btn ${authWarning || popupClosedWarning ? 'highlight' : ''}`}
+                onClick={handleGoogleSignIn}
+                disabled={isSigningIn}
+              >
+                {isSigningIn ? 'Connecting...' : 'Sign in with Google'}
+              </button>
+              <button
+                type="button"
+                className="sync-btn"
+                onClick={handleGoogleSignInRedirect}
+                disabled={isSigningIn}
+                title="Bypasses popup windows (recommended if popup closes instantly)"
+              >
+                Redirect Login
+              </button>
+            </div>
           )}
         </div>
       </div>
+
+      {popupClosedWarning && !authWarning && (
+        <div className="auth-alert" role="alert">
+          <div className="auth-alert-header">
+            <div className="auth-alert-title">
+              <span className="auth-alert-badge">Popup Closed</span>
+              <span>Window Closed Automatically</span>
+            </div>
+            <button
+              type="button"
+              className="auth-alert-close"
+              onClick={() => setPopupClosedWarning(false)}
+              aria-label="Dismiss warning"
+            >
+              ✕
+            </button>
+          </div>
+          <p className="auth-alert-desc">
+            The login window closed before completion. This usually occurs when your domain is not authorized in Firebase Console or your browser blocks popups/third-party storage:
+          </p>
+          <div className="auth-alert-steps">
+            <ol>
+              <li>
+                <strong>Instant Fix</strong>: Click below to sign in via <strong>Page Redirect</strong> (doesn't use popups):
+              </li>
+              <li>
+                Or ensure your domain (<code>{typeof window !== 'undefined' ? window.location.hostname : ''}</code>) is added in{' '}
+                <a
+                  href="https://console.firebase.google.com/project/graphical-castle-m6rpq/authentication/settings"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="auth-link"
+                >
+                  Firebase Authorized Domains ↗
+                </a>
+              </li>
+            </ol>
+          </div>
+          <div className="auth-alert-actions">
+            <button
+              type="button"
+              className="sync-btn redirect-btn"
+              onClick={handleGoogleSignInRedirect}
+              disabled={isSigningIn}
+            >
+              Sign In via Page Redirect (Recommended)
+            </button>
+            <button
+              type="button"
+              className="sync-btn auth-retry-btn"
+              onClick={handleGoogleSignIn}
+              disabled={isSigningIn}
+            >
+              Retry Popup
+            </button>
+          </div>
+        </div>
+      )}
 
       {authWarning && (
         <div className="auth-alert" role="alert">

@@ -445,6 +445,18 @@ select {
   color: #1a0f00;
 }
 
+.redirect-btn {
+  background: #2563eb;
+  color: #fff;
+  font-weight: 600;
+  border: none;
+}
+
+.redirect-btn:hover {
+  background: #3b82f6;
+  color: #fff;
+}
+
 .auth-alert-local-note {
   font-size: 0.78rem;
   color: var(--mute);
