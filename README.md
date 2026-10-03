@@ -183,4 +183,10 @@ password-generator/
 
 ## 👨‍💻 Project Summary
 
-This project demonstrates how a simple **iterative algorithm with random character selection** can be used to generate passwords efficiently. The project also demonstrates basic input validation, algorithm design, complexity analysis, and testing.
+This project demonstrates how a simple **iterative algorithm with random character selection** can be used to generate passwords efficiently. The project also demonstrates basic input validation.
+
+---
+
+## 🔗 Live Demo
+
+Visit the live application: https://password-generator-3-k06xs98pv-amaraganipraveen1-1991.vercel.app/
