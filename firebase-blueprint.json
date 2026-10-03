@@ -15,7 +15,7 @@
         },
         "password": {
           "type": "string",
-          "maxLength": 512
+          "maxLength": 1024
         },
         "time": {
           "type": "string",
@@ -46,7 +46,9 @@
           "maxLength": 128
         },
         "length": {
-          "type": "integer"
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 128
         },
         "preset": {
           "type": "string",

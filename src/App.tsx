@@ -555,10 +555,11 @@ export default function App() {
   };
 
   const handleLenChange = (newLen: number) => {
-    setLen(newLen);
-    generate(newLen, upper, lower, nums, syms, similar, ambig, norepeat, start);
+    const clamped = Math.max(4, Math.min(128, newLen));
+    setLen(clamped);
+    generate(clamped, upper, lower, nums, syms, similar, ambig, norepeat, start);
     syncDeviceState({
-      len: newLen,
+      len: clamped,
       preset,
       upper,
       lower,
@@ -990,6 +991,11 @@ export default function App() {
           aria-label="Generated password"
           placeholder="Click Generate"
           value={password}
+          title={password ? `Length: ${password.length} characters` : ''}
+          style={{
+            fontSize: password.length > 48 ? '0.82rem' : password.length > 24 ? '0.95rem' : '1.15rem',
+            letterSpacing: password.length > 48 ? '0.5px' : '1px'
+          }}
         />
         <button id="copy" type="button" onClick={copyToClipboard}>
           Copy
@@ -1017,17 +1023,38 @@ export default function App() {
       </div>
 
       <div className="row">
-        <span>Length</span>
+        <span>Length (4–128)</span>
         <strong id="lenLabel">{len}</strong>
       </div>
       <input
         type="range"
         id="len"
         min={4}
-        max={64}
+        max={128}
         value={len}
         onChange={e => handleLenChange(Number(e.target.value))}
       />
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '-10px', marginBottom: '18px' }}>
+        {[12, 16, 20, 32, 64, 128].map(l => (
+          <button
+            key={l}
+            type="button"
+            className="ghost"
+            style={{
+              padding: '2px 8px',
+              fontSize: '0.78rem',
+              height: '24px',
+              borderRadius: '6px',
+              border: len === l ? '1px solid var(--accent)' : '1px solid var(--line)',
+              color: len === l ? 'var(--accent)' : 'var(--mute)',
+              background: len === l ? 'rgba(61, 220, 151, 0.1)' : 'transparent'
+            }}
+            onClick={() => handleLenChange(l)}
+          >
+            {l}
+          </button>
+        ))}
+      </div>
 
       <div className="grid">
         <label className="opt">

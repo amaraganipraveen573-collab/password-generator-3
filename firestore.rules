@@ -31,7 +31,7 @@ service cloud.firestore {
         && data.keys().hasOnly(['id', 'name', 'password', 'time', 'userId', 'createdAt', 'updatedAt'])
         && data.id is string && data.id.size() > 0 && data.id.size() <= 128
         && data.name is string && data.name.size() <= 120
-        && data.password is string && data.password.size() > 0 && data.password.size() <= 512
+        && data.password is string && data.password.size() > 0 && data.password.size() <= 1024
         && data.time is string && data.time.size() <= 64
         && data.userId is string && data.userId == request.auth.uid
         && data.createdAt is timestamp
@@ -42,7 +42,7 @@ service cloud.firestore {
       return data.keys().hasAll(['userId', 'length', 'preset', 'upper', 'lower', 'nums', 'syms', 'similar', 'ambig', 'norepeat', 'start', 'updatedAt'])
         && data.keys().hasOnly(['userId', 'length', 'preset', 'upper', 'lower', 'nums', 'syms', 'similar', 'ambig', 'norepeat', 'start', 'updatedAt'])
         && data.userId is string && data.userId == request.auth.uid
-        && data.length is int && data.length >= 4 && data.length <= 64
+        && data.length is int && data.length >= 4 && data.length <= 128
         && data.preset is string && data.preset.size() <= 32
         && data.upper is bool && data.lower is bool && data.nums is bool && data.syms is bool
         && data.similar is bool && data.ambig is bool && data.norepeat is bool && data.start is bool
